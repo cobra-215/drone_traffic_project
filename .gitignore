@@ -3,3 +3,12 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Trained model weights -- too large for plain git (this project's best.pt
+# is ~79 MB) and not source anyway. Distribute separately (shared drive,
+# a GitHub Release asset, or Git LFS if you want it versioned).
+models/
+*.pt
+
+# Output of camera/analyze_video.py -- generated reports, not source.
+traffic_report/

@@ -1,0 +1,8 @@
+# Offline traffic-analysis stack (camera/detector.py, camera/processor.py,
+# camera/pipeline.py, camera/traffic_metrics.py, camera/analyze_video.py).
+# Installed separately from requirements.txt so the flight process on the
+# Raspberry Pi never depends on torch/ultralytics/matplotlib.
+ultralytics==8.4.129
+opencv-python==5.0.0.93
+numpy==2.5.2
+matplotlib==3.11.1

@@ -1,6 +1,7 @@
 import asyncio
 
 from config import settings
+from . import exceptions as ex
 
 
 class Telemetry:
@@ -9,21 +10,31 @@ class Telemetry:
     def __init__(self, drone):
         self.drone = drone
 
-    async def _get_single_sample(self, stream_func):
+    async def _get_single_sample(self, stream_func, stream_name=None):
         """
         Read one sample from a MAVSDK telemetry stream.
 
         The stream is always closed, and waiting is limited by the configured
-        telemetry timeout.
+        telemetry timeout. A stall is raised as TelemetryTimeoutError rather
+        than a raw asyncio.TimeoutError, so callers (in particular Emergency)
+        can recognise a stalled link and abort without commanding flight over
+        a link that has just demonstrated it is not working.
         """
 
         stream = stream_func()
+        name = stream_name or getattr(stream_func, "__name__", "unknown")
 
         try:
             return await asyncio.wait_for(
                 anext(stream),
                 timeout=settings.TELEMETRY_TIMEOUT,
             )
+        except asyncio.TimeoutError as e:
+            raise ex.TelemetryTimeoutError(
+                f"Telemetry stream '{name}' produced no sample within "
+                f"{settings.TELEMETRY_TIMEOUT:.1f}s.",
+                stream_name=name,
+            ) from e
         finally:
             await stream.aclose()
 
@@ -94,4 +105,30 @@ class Telemetry:
 
         return await self._get_single_sample(
             self.drone.system.telemetry.armed
+        )
+
+    async def get_home(self):
+        """
+        Return one current MAVSDK Position sample for the home position.
+
+        Used to validate/monitor distance from home; distinct from
+        get_position(), which returns the vehicle's current position.
+        """
+
+        return await self._get_single_sample(
+            self.drone.system.telemetry.home
+        )
+
+    async def get_landed_state(self):
+        """
+        Return the current MAVSDK LandedState (ON_GROUND / TAKING_OFF /
+        IN_AIR / LANDING / UNKNOWN).
+
+        This is PX4's own assessment of whether the vehicle is on the
+        ground, and is a stronger landing-confirmation signal than a
+        relative-altitude threshold alone.
+        """
+
+        return await self._get_single_sample(
+            self.drone.system.telemetry.landed_state
         )

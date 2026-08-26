@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 
+from .detections import get_detections
+
 
 class TrafficProcessor:
 
@@ -24,12 +26,14 @@ class TrafficProcessor:
 
   def process_tracks(self, tracking_results, frame):
     """Extract vehicle centroids, check ROI intersections, and annotate frame."""
-    if tracking_results.boxes is None or tracking_results.boxes.id is None:
+    # get_detections() reads whichever of .boxes / .obb the model
+    # populated -- standard detectors use .boxes, OBB (oriented
+    # bounding box) detectors use .obb instead, and .boxes is always
+    # None for an OBB model. Both expose the same xyxy/id/cls/conf
+    # attribute names, so this is the only branch needed.
+    boxes, track_ids, class_ids, _confs = get_detections(tracking_results)
+    if boxes is None:
       return frame, self.lane_counts
-
-    boxes = tracking_results.boxes.xyxy.cpu().numpy()
-    track_ids = tracking_results.boxes.id.int().cpu().numpy()
-    class_ids = tracking_results.boxes.cls.int().cpu().numpy()
 
     for box, track_id, cls_id in zip(boxes, track_ids, class_ids):
       x1, y1, x2, y2 = box
