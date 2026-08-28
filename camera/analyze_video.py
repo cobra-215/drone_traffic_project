@@ -29,6 +29,11 @@ Usage:
         --model models/best.pt --video clip.mp4 --mode screenline \\
         --line northbound:640,0,640,720 --line eastbound:0,360,1280,360 \\
         --pcu van=1.4
+
+    # 30-second demo clip with detections/tracking drawn on:
+    python -m camera.analyze_video \\
+        --model models/best.pt --video clip.mp4 \\
+        --save-annotated --max-seconds 30
 """
 
 import argparse
@@ -108,6 +113,23 @@ def _centroids_from_xyxy(xyxy):
     ]
 
 
+def _draw_counting_lines(frame, lines):
+    """Overlay each CountingLine (yellow) and its name onto a frame."""
+    for line in lines or []:
+        a = (int(line.a[0]), int(line.a[1]))
+        b = (int(line.b[0]), int(line.b[1]))
+        cv2.line(frame, a, b, (0, 255, 255), 2)
+        cv2.putText(
+            frame,
+            line.name,
+            (a[0] + 5, a[1] + 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 255),
+            2,
+        )
+
+
 def build_analyzer(mode, class_names, window_seconds, pcu_overrides, lines):
     if mode == "density":
         return DensityAnalyzer(
@@ -134,7 +156,14 @@ def analyze(
     mode="density",
     pcu_overrides=None,
     lines=None,
+    save_annotated=False,
+    show=False,
+    max_seconds=None,
+    annotated_scale=1.0,
 ):
+    if not 0 < annotated_scale <= 1.0:
+        raise ValueError("annotated_scale must be in (0, 1].")
+
     os.makedirs(output_dir, exist_ok=True)
 
     detector = TrafficDetector(
@@ -158,6 +187,14 @@ def analyze(
     for class_name, weight in analyzer.pcu_table().items():
         print(f"  {class_name}: {weight}")
 
+    annotated_path = os.path.join(output_dir, f"{mode}_annotated.mp4")
+    writer = None  # created lazily once the first frame gives us the size
+    if show:
+        print(
+            "Live preview enabled -- press 'q' in the window to stop early. "
+            "(Needs a display; on WSL this needs WSLg or an X server.)"
+        )
+
     frame_index = 0
     print(f"Analyzing {video_path} at {fps:.1f} fps...")
 
@@ -171,6 +208,9 @@ def analyze(
             xyxy, track_ids, class_ids, _confs = get_detections(results)
             frame_time_s = frame_index / fps
 
+            if max_seconds is not None and frame_time_s >= max_seconds:
+                break
+
             if mode == "screenline":
                 analyzer.record(
                     frame_time_s,
@@ -181,11 +221,45 @@ def analyze(
             else:
                 analyzer.record(frame_time_s, track_ids, class_ids)
 
+            if save_annotated or show:
+                annotated = results.plot()  # boxes + labels + track IDs
+                _draw_counting_lines(annotated, lines)
+                if annotated_scale != 1.0:
+                    annotated = cv2.resize(
+                        annotated,
+                        None,
+                        fx=annotated_scale,
+                        fy=annotated_scale,
+                        interpolation=cv2.INTER_AREA,
+                    )
+                if save_annotated:
+                    if writer is None:
+                        h, w = annotated.shape[:2]
+                        writer = cv2.VideoWriter(
+                            annotated_path,
+                            cv2.VideoWriter_fourcc(*"mp4v"),
+                            fps,
+                            (w, h),
+                        )
+                    writer.write(annotated)
+                if show:
+                    cv2.imshow("traffic analysis", annotated)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        print("  stopped early by user.")
+                        break
+
             frame_index += 1
             if frame_index % 100 == 0:
                 print(f"  processed {frame_index} frames ({frame_time_s:.1f}s)...")
     finally:
         cap.release()
+        if writer is not None:
+            writer.release()
+        if show:
+            cv2.destroyAllWindows()
+
+    if save_annotated and writer is not None:
+        print(f"Annotated video: {annotated_path}")
 
     if mode == "screenline":
         print(
@@ -264,6 +338,39 @@ if __name__ == "__main__":
             "default from camera/traffic_metrics.py:PCU_FACTORS."
         ),
     )
+    parser.add_argument(
+        "--save-annotated",
+        action="store_true",
+        help=(
+            "Also write <output-dir>/<mode>_annotated.mp4 with detection "
+            "boxes, class labels, and track IDs drawn on every frame "
+            "(plus the counting lines in screenline mode). Good for demos."
+        ),
+    )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help=(
+            "Show a live preview window while analyzing (press 'q' to stop). "
+            "Needs a display; on WSL this needs WSLg or an X server."
+        ),
+    )
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=None,
+        help="Stop after this many seconds of video (handy for short demos).",
+    )
+    parser.add_argument(
+        "--annotated-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Downscale factor in (0, 1] for the --save-annotated video only "
+            "(e.g. 0.5 -> half size, ~4x smaller file). Analysis is "
+            "unaffected. Default 1.0 (full size)."
+        ),
+    )
     args = parser.parse_args()
 
     lines = parse_lines(args.line)
@@ -279,4 +386,8 @@ if __name__ == "__main__":
         mode=args.mode,
         pcu_overrides=parse_pcu_overrides(args.pcu),
         lines=lines,
+        save_annotated=args.save_annotated,
+        show=args.show,
+        max_seconds=args.max_seconds,
+        annotated_scale=args.annotated_scale,
     )

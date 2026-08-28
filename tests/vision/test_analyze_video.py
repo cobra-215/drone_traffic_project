@@ -90,3 +90,21 @@ def test_centroids_from_boxes():
 
 def test_centroids_none_passthrough():
     assert _centroids_from_xyxy(None) is None
+
+
+# --- annotated_scale validation ------------------------------------------
+
+
+def test_analyze_rejects_bad_annotated_scale(tmp_path):
+    from camera.analyze_video import analyze
+
+    for bad in (0.0, -0.5, 1.5):
+        with pytest.raises(ValueError):
+            analyze(
+                model_path="unused",
+                video_path="unused",
+                output_dir=str(tmp_path),
+                window_seconds=10,
+                confidence_threshold=0.4,
+                annotated_scale=bad,
+            )

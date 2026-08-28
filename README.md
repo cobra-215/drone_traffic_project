@@ -214,6 +214,24 @@ editing code:
 Unknown class names fall back to 1.0 with a printed warning. The run
 prints the full class→weight table it will use before starting.
 
+### Seeing the detections (demos)
+
+Add `--save-annotated` to also write `<output-dir>/<mode>_annotated.mp4`
+with detection boxes, class labels, and track IDs drawn on every frame
+(plus the counting lines, in screenline mode). `--show` opens a live
+preview window instead (needs a display; on WSL, WSLg or an X server).
+`--max-seconds N` stops early, and `--annotated-scale 0.5` shrinks the
+output video (analysis unaffected) — handy for a shareable demo clip:
+
+```bash
+python -m camera.analyze_video --model models/best.pt --video clip.mp4 \
+    --save-annotated --max-seconds 30 --annotated-scale 0.5
+```
+
+OpenCV's `mp4v` codec is not very space-efficient; re-encode the result
+with ffmpeg (`ffmpeg -i in.mp4 -c:v libx264 -crf 23 out.mp4`) for a
+~10x smaller file if you need to email it.
+
 See `camera/traffic_metrics.py` for the methodology behind each mode.
 
 ### Model weights
