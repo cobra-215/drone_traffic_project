@@ -271,12 +271,12 @@ class Drone:
     """
 
     stop = getattr(self.system, "_stop_mavsdk_server", None)
-    if stop is None:
+    if not callable(stop):
       # MAVSDK's internal API changed; nothing we can do here without
       # depending further on undocumented internals.
       print(
-          "Drone.disconnect: mavsdk.System has no _stop_mavsdk_server; "
-          "skipping explicit cleanup."
+          "Drone.disconnect: mavsdk.System has no callable "
+          "_stop_mavsdk_server; skipping explicit cleanup."
       )
       return
 

@@ -37,6 +37,16 @@ def test_disconnect_is_a_noop_when_stop_mavsdk_server_missing():
     drone.disconnect()  # must not raise
 
 
+def test_disconnect_is_a_noop_when_stop_mavsdk_server_not_callable():
+    class FakeSystemWithNonCallableStop:
+        _stop_mavsdk_server = "not a method"
+
+    drone = Drone()
+    drone.system = FakeSystemWithNonCallableStop()
+
+    drone.disconnect()  # must not raise, must not try to call the string
+
+
 def test_disconnect_swallows_errors_from_stop_mavsdk_server():
     class FakeSystemThatFails:
         def _stop_mavsdk_server(self):
