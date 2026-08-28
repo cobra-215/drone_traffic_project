@@ -39,8 +39,8 @@ camera/                  Camera + offline vision analysis
   factory.py                  Selects the recorder backend from config.settings.CAMERA_BACKEND
   detector.py / processor.py    YOLO detection+tracking / ROI lane counting (offline only)
   detections.py                 Shared helper: reads results.boxes OR results.obb (OBB models)
-  traffic_metrics.py             Time-binned, PCU-weighted traffic volume + flow-rate report
-  analyze_video.py                 CLI: run a trained model over a recording, write CSV + plot
+  traffic_metrics.py             DensityAnalyzer + ScreenlineAnalyzer: time-windowed PCU-weighted reports
+  analyze_video.py                 CLI: run a model over a recording (--mode density|screenline), write CSV + plot
 
 tests/
   unit/                    Fast, no-MAVSDK-no-hardware tests for flight/ and mission/
@@ -82,7 +82,7 @@ run on every change.
 pytest tests/vision -q
 ```
 
-16 tests for the offline traffic-analysis code (needs
+44 tests for the offline traffic-analysis code (needs
 `requirements-vision.txt` installed).
 
 ## Flying a mission in SITL/Gazebo
@@ -155,32 +155,73 @@ warns at every preflight if an application limit is looser than the
 real PX4 airframe's own configured limit — read `docs/px4_parameter_checklist.md`
 before ever flying real hardware.
 
-## Offline traffic-volume analysis
+## Offline traffic analysis
 
 Once you have a recorded video (from a real flight, or any drone
-footage) and a trained YOLO model (standard or OBB task):
+footage) and a trained YOLO model (standard or OBB task), there are two
+analysis modes — pick the one that matches your footage.
+
+### `--mode density` (default) — occupancy / congestion
 
 ```bash
 python -m camera.analyze_video \
-    --model /path/to/best.pt \
+    --model models/best.pt \
     --video /path/to/recording.mp4 \
-    --output-dir ./traffic_report \
-    --bin-seconds 60
+    --window-seconds 10
 ```
 
-Produces `traffic_report.csv` and `traffic_report.png`: per-class
-vehicle counts and a Passenger-Car-Unit-weighted traffic volume per time
-bin, plus the equivalent hourly flow rate (`q = n / T`, the standard
-Highway Capacity Manual formula). Every tracked vehicle is counted once,
-at first sighting — not once per frame. See `camera/traffic_metrics.py`
-for the full methodology and the PCU factor table (calibrated for
-common vehicle class names; extend `PCU_FACTORS` or pass
-`pcu_factors=` to match your model's actual classes).
+Produces `density_report.csv` / `.png`: per time window, the mean and peak
+number of vehicles visible per frame (overall and per class), the mean
+PCU-weighted occupancy, and how many distinct vehicles were seen. This
+is the right measure for a wide-area drone-hover view where many
+vehicles are in frame at once. It deliberately does **not** report a
+vehicles/hour flow rate — counting "vehicles that appeared somewhere in
+a wide field of view" and annualising it is not a meaningful flow
+measurement.
 
-Trained model weights are not committed to this repository (see
-`.gitignore` — `models/`, `*.pt`) since they're large binary artifacts,
-not source. Get `best.pt` from whoever trained it and place it wherever
-you like; pass its path via `--model`.
+### `--mode screenline` — actual traffic flow
+
+```bash
+python -m camera.analyze_video \
+    --model models/best.pt \
+    --video /path/to/recording.mp4 \
+    --mode screenline \
+    --line northbound:640,0,640,720 \
+    --line eastbound:0,360,1280,360 \
+    --window-seconds 10
+```
+
+Produces `screenline_report.csv` / `.png`: for each counting line and
+each direction across it, the number of vehicles whose track crossed the
+line per time window, per class, plus the flow rate in vehicles/hour
+(`q = n / T`, the standard Highway Capacity Manual formula — valid here
+because a line crossing *is* a cross-section count). Each `--line` is
+`[NAME:]X1,Y1,X2,Y2` in pixel coordinates (origin top-left); repeat it
+for multiple lines. Direction is reported as `+`/`-` (a documented
+convention — one run shows you which physical heading each is).
+
+### PCU weights
+
+Both modes weight vehicle classes by Passenger Car Unit factors (a bus
+or truck occupies more road capacity than a car). Defaults are in
+`camera/traffic_metrics.py:PCU_FACTORS`; override per-run without
+editing code:
+
+```bash
+--pcu van=1.4 bus=2.2
+```
+
+Unknown class names fall back to 1.0 with a printed warning. The run
+prints the full class→weight table it will use before starting.
+
+See `camera/traffic_metrics.py` for the methodology behind each mode.
+
+### Model weights
+
+Not committed to this repository (see `.gitignore` — `models/`, `*.pt`)
+since they're large binary artifacts, not source. Get `best.pt` from
+whoever trained it, place it in `models/` (or anywhere), and pass its
+path via `--model`.
 
 ## Safety status
 
