@@ -3,13 +3,25 @@ Tests for camera/analyze_video.py helpers. Requires requirements-vision.txt.
 Run separately from the flight-critical suite: `pytest tests/vision`.
 """
 
+import numpy as np
 import pytest
 
 from camera.analyze_video import (
     _centroids_from_xyxy,
+    _draw_regions,
+    build_analyzer,
     parse_lines,
     parse_pcu_overrides,
 )
+from camera.traffic_metrics import (
+    CountingLine,
+    DensityAnalyzer,
+    ScreenlineAnalyzer,
+    Zone,
+    ZoneAnalyzer,
+)
+
+CLASS_NAMES = {0: "car", 1: "van", 2: "truck", 3: "bus"}
 
 
 # --- parse_pcu_overrides ---------------------------------------------------
@@ -90,6 +102,77 @@ def test_centroids_from_boxes():
 
 def test_centroids_none_passthrough():
     assert _centroids_from_xyxy(None) is None
+
+
+# --- build_analyzer --------------------------------------------------------
+
+
+def _line():
+    return CountingLine("gate", 5, 0, 5, 10)
+
+
+def _zone():
+    return Zone("arm", [(0, 0), (10, 0), (10, 10), (0, 10)])
+
+
+def _build(mode, **kwargs):
+    kwargs.setdefault("class_names", CLASS_NAMES)
+    kwargs.setdefault("window_seconds", 60)
+    kwargs.setdefault("pcu_overrides", None)
+    return build_analyzer(mode, **kwargs)
+
+
+def test_build_analyzer_density():
+    assert isinstance(_build("density"), DensityAnalyzer)
+
+
+def test_build_analyzer_screenline():
+    assert isinstance(_build("screenline", lines=[_line()]), ScreenlineAnalyzer)
+
+
+def test_build_analyzer_zones():
+    assert isinstance(_build("zones", zones=[_zone()]), ZoneAnalyzer)
+
+
+def test_build_analyzer_zones_without_zones_raises():
+    with pytest.raises(ValueError):
+        _build("zones", zones=[])
+
+
+def test_build_analyzer_screenline_without_lines_raises():
+    with pytest.raises(ValueError):
+        _build("screenline", lines=[])
+
+
+def test_build_analyzer_rejects_unknown_mode():
+    with pytest.raises(ValueError):
+        _build("hovercraft")
+
+
+def test_every_analyzer_shares_one_record_signature():
+    # analyze_video's frame loop calls record() the same way for every
+    # mode; if these signatures ever diverge again the loop breaks.
+    for analyzer in (
+        _build("density"),
+        _build("screenline", lines=[_line()]),
+        _build("zones", zones=[_zone()]),
+    ):
+        analyzer.record(0.0, [1], [0], [(5, 5)])
+
+
+# --- _draw_regions ---------------------------------------------------------
+
+
+def test_draw_regions_marks_the_frame():
+    frame = np.zeros((20, 20, 3), dtype=np.uint8)
+    _draw_regions(frame, lines=[_line()], zones=[_zone()])
+    assert frame.any(), "expected the overlay to have drawn something"
+
+
+def test_draw_regions_with_nothing_to_draw_is_a_noop():
+    frame = np.zeros((20, 20, 3), dtype=np.uint8)
+    _draw_regions(frame, lines=None, zones=None)
+    assert not frame.any()
 
 
 # --- annotated_scale validation ------------------------------------------

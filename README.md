@@ -39,8 +39,10 @@ camera/                  Camera + offline vision analysis
   factory.py                  Selects the recorder backend from config.settings.CAMERA_BACKEND
   detector.py / processor.py    YOLO detection+tracking / ROI lane counting (offline only)
   detections.py                 Shared helper: reads results.boxes OR results.obb (OBB models)
-  traffic_metrics.py             DensityAnalyzer + ScreenlineAnalyzer: time-windowed PCU-weighted reports
-  analyze_video.py                 CLI: run a model over a recording (--mode density|screenline), write CSV + plot
+  regions.py                     Load/save the counting-line + zone JSON file (stdlib only)
+  draw_regions.py                 CLI: click your counting lines and intersection zones on a video frame
+  traffic_metrics.py               Density / Screenline / Zone analyzers: time-windowed PCU-weighted reports
+  analyze_video.py                  CLI: run a model over a recording (--mode density|screenline|zones)
 
 tests/
   unit/                    Fast, no-MAVSDK-no-hardware tests for flight/ and mission/
@@ -73,7 +75,7 @@ required to fly a mission or run the flight-critical tests.
 pytest tests/unit -q
 ```
 
-99 tests covering flight/mission logic, the exception-dispatch policy,
+100 tests covering flight/mission logic, the exception-dispatch policy,
 mission validation, config consistency, and the PX4 parameter audit —
 all against fakes, no MAVSDK connection required. This is the suite to
 run on every change.
@@ -82,7 +84,7 @@ run on every change.
 pytest tests/vision -q
 ```
 
-44 tests for the offline traffic-analysis code (needs
+88 tests for the offline traffic-analysis code (needs
 `requirements-vision.txt` installed).
 
 ## Flying a mission in SITL/Gazebo
@@ -158,8 +160,47 @@ before ever flying real hardware.
 ## Offline traffic analysis
 
 Once you have a recorded video (from a real flight, or any drone
-footage) and a trained YOLO model (standard or OBB task), there are two
+footage) and a trained YOLO model (standard or OBB task), there are three
 analysis modes — pick the one that matches your footage.
+
+### First: draw your regions by clicking
+
+Two of the three modes need you to mark where on the frame to count.
+Don't guess pixel coordinates — click them:
+
+```bash
+python -m camera.draw_regions \
+    --video /path/to/recording.mp4 \
+    --output regions.json \
+    --at-seconds 5 \
+    --scale 0.6
+```
+
+This opens one frame of the video in a window. `--at-seconds` picks a
+moment where the roads are clearly visible; `--scale` shrinks the window
+for footage bigger than your screen (saved coordinates are always in the
+video's full resolution regardless).
+
+| Key / action | Effect |
+|---|---|
+| left click | add a point |
+| `u` / backspace | undo the last point |
+| `l` | finish the current shape as a **line** (exactly 2 points) |
+| `z` | finish the current shape as a **zone** polygon (3+ points) |
+| `d` | delete the last completed shape |
+| `s` | save to `--output` and quit |
+| `q` / ESC | quit without saving |
+
+Each finished shape prompts for a name in the terminal (press Enter to
+accept `line1` / `zone1`). Draw **lines** across a road for
+`--mode screenline`; draw one **zone** over each approach arm of an
+intersection for `--mode zones`.
+
+Needs a display — on WSL, WSLg or an X server.
+
+The resulting `regions.json` records the resolution it was drawn
+against, so running it over a different-sized video warns instead of
+silently producing wrong counts.
 
 ### `--mode density` (default) — occupancy / congestion
 
@@ -186,8 +227,7 @@ python -m camera.analyze_video \
     --model models/best.pt \
     --video /path/to/recording.mp4 \
     --mode screenline \
-    --line northbound:640,0,640,720 \
-    --line eastbound:0,360,1280,360 \
+    --regions regions.json \
     --window-seconds 10
 ```
 
@@ -195,14 +235,46 @@ Produces `screenline_report.csv` / `.png`: for each counting line and
 each direction across it, the number of vehicles whose track crossed the
 line per time window, per class, plus the flow rate in vehicles/hour
 (`q = n / T`, the standard Highway Capacity Manual formula — valid here
-because a line crossing *is* a cross-section count). Each `--line` is
-`[NAME:]X1,Y1,X2,Y2` in pixel coordinates (origin top-left); repeat it
-for multiple lines. Direction is reported as `+`/`-` (a documented
-convention — one run shows you which physical heading each is).
+because a line crossing *is* a cross-section count). Direction is
+reported as `+`/`-` (a documented convention — one run shows you which
+physical heading each is).
+
+If you already know the pixel coordinates you can skip the drawing step
+and pass `--line [NAME:]X1,Y1,X2,Y2` instead, repeated per line.
+
+### `--mode zones` — an intersection
+
+```bash
+python -m camera.analyze_video \
+    --model models/best.pt \
+    --video /path/to/intersection.mp4 \
+    --mode zones \
+    --regions regions.json \
+    --window-seconds 20
+```
+
+Draw one zone polygon over each approach arm. Produces **two** CSV/PNG
+pairs:
+
+- `zones_report_occupancy.csv` / `.png` — per time window and per arm:
+  mean and peak vehicles inside that arm, per class, plus mean PCU. This
+  is `--mode density`'s measure computed per arm rather than over the
+  whole frame, so it likewise carries no flow rate.
+- `zones_report_movements.csv` / `.png` — the **turning-movement count**:
+  per time window, how many vehicles travelled from arm A to arm B
+  (`east_arm->west_arm`, `north_arm->east_arm`, …), per class, with PCU
+  weighting and a vehicles/hour flow rate. A movement is a genuine
+  directional cross-section count, so `q = n / T` applies here too.
+
+A vehicle crossing the intersection is inside no zone at all while it's
+in the middle box, so the analyzer remembers each track's last *named*
+zone and emits the movement when it next enters a different one —
+however many zone-less frames sat in between. Overlapping zones resolve
+to whichever is listed first, rather than double-counting.
 
 ### PCU weights
 
-Both modes weight vehicle classes by Passenger Car Unit factors (a bus
+All modes weight vehicle classes by Passenger Car Unit factors (a bus
 or truck occupies more road capacity than a car). Defaults are in
 `camera/traffic_metrics.py:PCU_FACTORS`; override per-run without
 editing code:
@@ -218,7 +290,7 @@ prints the full class→weight table it will use before starting.
 
 Add `--save-annotated` to also write `<output-dir>/<mode>_annotated.mp4`
 with detection boxes, class labels, and track IDs drawn on every frame
-(plus the counting lines, in screenline mode). `--show` opens a live
+(plus your counting lines and zone polygons). `--show` opens a live
 preview window instead (needs a display; on WSL, WSLg or an X server).
 `--max-seconds N` stops early, and `--annotated-scale 0.5` shrinks the
 output video (analysis unaffected) — handy for a shareable demo clip:

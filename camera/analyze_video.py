@@ -12,7 +12,16 @@ a report split into fixed-length time windows, in one of two modes:
   --mode screenline  actual traffic flow: vehicles/hour across one or
                      more counting lines you define with --line. A
                      vehicle is counted once, when its track crosses a
-                     line. Requires at least one --line.
+                     line. Requires at least one --line or --regions.
+
+  --mode zones       an intersection, described as one polygon per
+                     approach arm. Reports per-arm occupancy AND turning
+                     movements (how many vehicles went from arm A to arm
+                     B), with flow rates. Requires --regions.
+
+Draw the lines and zones by clicking on a video frame:
+
+    python -m camera.draw_regions --video clip.mp4 --output regions.json
 
 See camera/traffic_metrics.py for the methodology behind each.
 
@@ -30,6 +39,10 @@ Usage:
         --line northbound:640,0,640,720 --line eastbound:0,360,1280,360 \\
         --pcu van=1.4
 
+    python -m camera.analyze_video \\
+        --model models/best.pt --video clip.mp4 \\
+        --mode zones --regions regions.json --window-seconds 30
+
     # 30-second demo clip with detections/tracking drawn on:
     python -m camera.analyze_video \\
         --model models/best.pt --video clip.mp4 \\
@@ -40,14 +53,26 @@ import argparse
 import os
 
 import cv2
+import numpy as np
 
 from .detections import get_detections
 from .detector import TrafficDetector
+from .regions import load_regions
 from .traffic_metrics import (
     CountingLine,
     DensityAnalyzer,
     ScreenlineAnalyzer,
+    ZoneAnalyzer,
 )
+
+ZONE_COLORS = [
+    (0, 200, 0),
+    (255, 128, 0),
+    (200, 0, 200),
+    (0, 128, 255),
+    (0, 0, 220),
+    (180, 180, 0),
+]
 
 
 def parse_pcu_overrides(pairs):
@@ -113,24 +138,51 @@ def _centroids_from_xyxy(xyxy):
     ]
 
 
-def _draw_counting_lines(frame, lines):
-    """Overlay each CountingLine (yellow) and its name onto a frame."""
+def _draw_regions(frame, lines=None, zones=None):
+    """
+    Overlay counting lines (yellow) and zone polygons (one colour each,
+    translucent fill) with their names, onto an annotated frame.
+    """
+
     for line in lines or []:
         a = (int(line.a[0]), int(line.a[1]))
         b = (int(line.b[0]), int(line.b[1]))
         cv2.line(frame, a, b, (0, 255, 255), 2)
-        cv2.putText(
-            frame,
-            line.name,
-            (a[0] + 5, a[1] + 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 255),
-            2,
-        )
+        _label(frame, line.name, a, (0, 255, 255))
+
+    if not zones:
+        return
+
+    overlay = frame.copy()
+    for index, zone in enumerate(zones):
+        color = ZONE_COLORS[index % len(ZONE_COLORS)]
+        polygon = np.array(zone.points, dtype=np.int32)
+        cv2.fillPoly(overlay, [polygon], color)
+        cv2.polylines(frame, [polygon], True, color, 2)
+    cv2.addWeighted(overlay, 0.25, frame, 0.75, 0, frame)
+
+    # Names go on after the blend so they stay at full contrast.
+    for index, zone in enumerate(zones):
+        color = ZONE_COLORS[index % len(ZONE_COLORS)]
+        centroid = zone.centroid()
+        _label(frame, zone.name, (int(centroid[0]), int(centroid[1])), color)
 
 
-def build_analyzer(mode, class_names, window_seconds, pcu_overrides, lines):
+def _label(frame, text, origin, color):
+    cv2.putText(
+        frame,
+        text,
+        (origin[0] + 5, origin[1] + 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        color,
+        2,
+    )
+
+
+def build_analyzer(
+    mode, class_names, window_seconds, pcu_overrides, lines=None, zones=None
+):
     if mode == "density":
         return DensityAnalyzer(
             class_names=class_names,
@@ -141,6 +193,13 @@ def build_analyzer(mode, class_names, window_seconds, pcu_overrides, lines):
         return ScreenlineAnalyzer(
             class_names=class_names,
             lines=lines,
+            window_seconds=window_seconds,
+            pcu_factors=pcu_overrides or None,
+        )
+    if mode == "zones":
+        return ZoneAnalyzer(
+            class_names=class_names,
+            zones=zones,
             window_seconds=window_seconds,
             pcu_factors=pcu_overrides or None,
         )
@@ -156,6 +215,8 @@ def analyze(
     mode="density",
     pcu_overrides=None,
     lines=None,
+    zones=None,
+    regions_path=None,
     save_annotated=False,
     show=False,
     max_seconds=None,
@@ -177,9 +238,24 @@ def analyze(
         raise FileNotFoundError(f"Could not open video source: {video_path}")
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frame_size = (
+        int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+    )
+
+    lines = list(lines or [])
+    zones = list(zones or [])
+    if regions_path:
+        # Loaded here rather than at argument-parsing time so the region
+        # file's stored resolution can be checked against this video's
+        # actual one -- pixel coordinates drawn on a different-sized
+        # frame are wrong in a way nothing downstream would reveal.
+        file_lines, file_zones = load_regions(regions_path, frame_size=frame_size)
+        lines.extend(file_lines)
+        zones.extend(file_zones)
 
     analyzer = build_analyzer(
-        mode, detector.model.names, window_seconds, pcu_overrides, lines
+        mode, detector.model.names, window_seconds, pcu_overrides, lines, zones
     )
 
     print(f"Mode: {mode}")
@@ -211,19 +287,16 @@ def analyze(
             if max_seconds is not None and frame_time_s >= max_seconds:
                 break
 
-            if mode == "screenline":
-                analyzer.record(
-                    frame_time_s,
-                    track_ids,
-                    class_ids,
-                    _centroids_from_xyxy(xyxy),
-                )
-            else:
-                analyzer.record(frame_time_s, track_ids, class_ids)
+            analyzer.record(
+                frame_time_s,
+                track_ids,
+                class_ids,
+                _centroids_from_xyxy(xyxy),
+            )
 
             if save_annotated or show:
                 annotated = results.plot()  # boxes + labels + track IDs
-                _draw_counting_lines(annotated, lines)
+                _draw_regions(annotated, lines, zones)
                 if annotated_scale != 1.0:
                     annotated = cv2.resize(
                         annotated,
@@ -266,6 +339,11 @@ def analyze(
             f"Done: {frame_index} frames processed, "
             f"{analyzer.total_crossings} line crossings counted."
         )
+    elif mode == "zones":
+        print(
+            f"Done: {frame_index} frames processed, "
+            f"{analyzer.total_movements} zone-to-zone movements counted."
+        )
     else:
         print(
             f"Done: {frame_index} frames processed, "
@@ -292,11 +370,24 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--mode",
-        choices=["density", "screenline"],
+        choices=["density", "screenline", "zones"],
         default="density",
         help=(
             "density (default): occupancy/congestion, no flow rate. "
-            "screenline: vehicles/hour across --line counting lines."
+            "screenline: vehicles/hour across counting lines. "
+            "zones: per-arm occupancy plus turning movements for an "
+            "intersection."
+        ),
+    )
+    parser.add_argument(
+        "--regions",
+        metavar="PATH",
+        default=None,
+        help=(
+            "JSON file of counting lines and zone polygons, as written by "
+            "'python -m camera.draw_regions'. This is the practical way to "
+            "define regions -- you click them on a video frame instead of "
+            "guessing pixel coordinates. Required for --mode zones."
         ),
     )
     parser.add_argument(
@@ -306,8 +397,9 @@ if __name__ == "__main__":
         default=[],
         help=(
             "A counting line in pixel coordinates (origin top-left), for "
-            "--mode screenline. Repeat for multiple lines, e.g. "
-            "--line northbound:640,0,640,720 . Required with --mode screenline."
+            "--mode screenline, if you already know the numbers. Repeat for "
+            "multiple lines, e.g. --line northbound:640,0,640,720 . Usually "
+            "easier to draw them with camera.draw_regions and pass --regions."
         ),
     )
     parser.add_argument(
@@ -374,8 +466,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     lines = parse_lines(args.line)
-    if args.mode == "screenline" and not lines:
-        parser.error("--mode screenline requires at least one --line")
+    if args.mode == "screenline" and not lines and not args.regions:
+        parser.error("--mode screenline requires --line or --regions")
+    if args.mode == "zones" and not args.regions:
+        parser.error(
+            "--mode zones requires --regions; draw the approach arms with "
+            "'python -m camera.draw_regions --video <video> --output regions.json'"
+        )
 
     analyze(
         model_path=args.model,
@@ -386,6 +483,7 @@ if __name__ == "__main__":
         mode=args.mode,
         pcu_overrides=parse_pcu_overrides(args.pcu),
         lines=lines,
+        regions_path=args.regions,
         save_annotated=args.save_annotated,
         show=args.show,
         max_seconds=args.max_seconds,

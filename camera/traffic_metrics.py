@@ -17,12 +17,19 @@ row per 10 seconds of video), in one of two modes.
   cross-section count, the standard flow-rate formula q = n / T applies
   and the reported vehicles/hour is meaningful.
 
+- ZoneAnalyzer (mode="zones"): an intersection, described as one polygon
+  per approach arm. Reports both per-arm occupancy (DensityAnalyzer's
+  measure, computed per zone) and TURNING MOVEMENTS -- how many vehicles
+  travelled from arm A to arm B. A movement is also a genuine
+  directional cross-section count, so q = n / T applies to it too.
+
 Part of the offline vision/analysis stack -- see requirements-vision.txt.
 Never imported by flight/ or mission/, and must never run on the
 Raspberry Pi's flight process.
 """
 
 import csv
+import os
 from collections import defaultdict
 
 
@@ -139,6 +146,36 @@ class CountingLine:
         return "+" if (line_x * move_y - line_y * move_x) > 0 else "-"
 
 
+class Zone:
+    """
+    A named polygon in pixel coordinates -- typically one approach arm
+    of an intersection.
+
+    May be convex or concave; _point_in_polygon() handles both.
+    """
+
+    def __init__(self, name, points):
+        points = [(float(x), float(y)) for x, y in points]
+        if len(points) < 3:
+            raise ValueError(
+                f"Zone {name!r} needs at least 3 points to be a polygon, "
+                f"got {len(points)}."
+            )
+        self.name = name
+        self.points = points
+
+    def contains(self, point):
+        return _point_in_polygon(point, self.points)
+
+    def centroid(self):
+        """Vertex average -- good enough for placing a label on a frame."""
+        n = len(self.points)
+        return (
+            sum(x for x, _ in self.points) / n,
+            sum(y for _, y in self.points) / n,
+        )
+
+
 class DensityAnalyzer:
     """
     Road occupancy / congestion from per-frame detections, one row per
@@ -168,7 +205,10 @@ class DensityAnalyzer:
     def pcu_table(self):
         return self.pcu.table(self.class_names)
 
-    def record(self, frame_time_s, track_ids, class_ids):
+    def record(self, frame_time_s, track_ids, class_ids, centroids=None):
+        # `centroids` is accepted and ignored so that all three analyzers
+        # share one record() signature and camera/analyze_video.py's frame
+        # loop does not have to branch on the mode.
         window_index = int(frame_time_s // self.window_seconds)
         w = self._windows[window_index]
         w["n_frames"] += 1
@@ -466,6 +506,338 @@ class ScreenlineAnalyzer:
         print(f"ScreenlineAnalyzer: wrote plot to {path}")
 
 
+class ZoneAnalyzer:
+    """
+    An intersection described as one polygon per approach arm.
+
+    Call record() once per frame with each tracked vehicle's centroid.
+    Produces two reports:
+
+    OCCUPANCY -- per (time window, zone): the mean and peak number of
+    vehicles inside that zone per frame, per class, plus mean PCU. This
+    is DensityAnalyzer's measure computed per arm, and like it, carries
+    no flow rate.
+
+    TURNING MOVEMENTS -- per (time window, from_zone -> to_zone): how
+    many vehicles travelled from one arm to another, per class, with
+    PCU weighting and a vehicles/hour flow rate. A movement IS a
+    directional cross-section count (each vehicle contributes once per
+    movement), so q = n / T is meaningful here.
+
+    Zones are tested in order and the first match wins, so overlapping
+    polygons resolve to the one listed first rather than double-counting.
+    """
+
+    def __init__(self, class_names, zones, pcu_factors=None, window_seconds=60.0):
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be positive.")
+        if not zones:
+            raise ValueError("ZoneAnalyzer needs at least one Zone.")
+
+        self.class_names = class_names
+        self.zones = list(zones)
+        self.window_seconds = window_seconds
+        self.pcu = PcuResolver(pcu_factors)
+        # track_id -> the last NAMED zone this track was seen in. Not
+        # cleared when a track leaves a zone -- see record().
+        self._last_zone = {}
+        self._frames = defaultdict(int)  # window_index -> frames recorded
+        # (window_index, zone_name) -> occupancy accumulator
+        self._occupancy = defaultdict(_new_zone_window)
+        # (window_index, from_zone, to_zone) -> {class_name: count}
+        self._movements = defaultdict(lambda: defaultdict(int))
+        self._total_movements = 0
+
+    @property
+    def total_movements(self):
+        return self._total_movements
+
+    def pcu_table(self):
+        return self.pcu.table(self.class_names)
+
+    def record(self, frame_time_s, track_ids, class_ids, centroids=None):
+        window_index = int(frame_time_s // self.window_seconds)
+        self._frames[window_index] += 1
+
+        if track_ids is None or centroids is None:
+            return
+
+        per_zone_class = defaultdict(lambda: defaultdict(int))
+
+        for track_id, class_id, centroid in zip(track_ids, class_ids, centroids):
+            track_id = int(track_id)
+            class_name = _resolve_class_name(self.class_names, class_id)
+            point = (float(centroid[0]), float(centroid[1]))
+
+            current_zone = None
+            for zone in self.zones:
+                if zone.contains(point):
+                    current_zone = zone.name
+                    break
+
+            if current_zone is None:
+                # The vehicle is between zones -- most importantly, in
+                # the middle of the intersection itself. _last_zone is
+                # deliberately NOT cleared here: that memory is exactly
+                # what lets an arm-to-arm movement be detected across
+                # the zone-less gap. Comparing only consecutive frames
+                # would never see a turning movement at all.
+                continue
+
+            per_zone_class[current_zone][class_name] += 1
+
+            previous_zone = self._last_zone.get(track_id)
+            self._last_zone[track_id] = current_zone
+
+            if previous_zone is not None and previous_zone != current_zone:
+                self._movements[
+                    (window_index, previous_zone, current_zone)
+                ][class_name] += 1
+                self._total_movements += 1
+
+        for zone_name, class_counts in per_zone_class.items():
+            w = self._occupancy[(window_index, zone_name)]
+            total = sum(class_counts.values())
+            w["total_sum"] += total
+            w["total_max"] = max(w["total_max"], total)
+            for class_name, count in class_counts.items():
+                w["class_sum"][class_name] += count
+
+    def occupancy_rows(self):
+        if not self._occupancy:
+            return []
+
+        class_names_seen = sorted(
+            {
+                name
+                for w in self._occupancy.values()
+                for name in w["class_sum"]
+            }
+        )
+
+        rows = []
+        for key in sorted(self._occupancy):
+            window_index, zone_name = key
+            w = self._occupancy[key]
+            n_frames = self._frames.get(window_index, 0)
+            n = n_frames or 1
+            mean_pcu = sum(
+                (w["class_sum"].get(name, 0) / n) * self.pcu.factor_for(name)
+                for name in class_names_seen
+            )
+            start_s = window_index * self.window_seconds
+            end_s = start_s + self.window_seconds
+            rows.append(
+                {
+                    "window": _format_window(start_s, end_s),
+                    "window_start_s": start_s,
+                    "window_end_s": end_s,
+                    "zone": zone_name,
+                    "frames": n_frames,
+                    **{
+                        f"mean_{name}": round(
+                            w["class_sum"].get(name, 0) / n, 2
+                        )
+                        for name in class_names_seen
+                    },
+                    "mean_vehicles_in_zone": round(w["total_sum"] / n, 2),
+                    "max_vehicles_in_zone": w["total_max"],
+                    "mean_pcu_in_zone": round(mean_pcu, 2),
+                }
+            )
+        return rows
+
+    def movement_rows(self):
+        if not self._movements:
+            return []
+
+        class_names_seen = sorted(
+            {
+                name
+                for class_counts in self._movements.values()
+                for name in class_counts
+            }
+        )
+
+        rows = []
+        for key in sorted(self._movements):
+            window_index, from_zone, to_zone = key
+            counts = self._movements[key]
+            total = sum(counts.values())
+            pcu_total = sum(
+                counts.get(name, 0) * self.pcu.factor_for(name)
+                for name in class_names_seen
+            )
+            start_s = window_index * self.window_seconds
+            end_s = start_s + self.window_seconds
+            rows.append(
+                {
+                    "window": _format_window(start_s, end_s),
+                    "window_start_s": start_s,
+                    "window_end_s": end_s,
+                    "movement": f"{from_zone}->{to_zone}",
+                    "from_zone": from_zone,
+                    "to_zone": to_zone,
+                    **{
+                        f"count_{name}": counts.get(name, 0)
+                        for name in class_names_seen
+                    },
+                    "total_count": total,
+                    "pcu_weighted_count": round(pcu_total, 2),
+                    "flow_rate_vph": round(
+                        total * 3600.0 / self.window_seconds, 1
+                    ),
+                    "pcu_flow_rate_vph": round(
+                        pcu_total * 3600.0 / self.window_seconds, 1
+                    ),
+                }
+            )
+        return rows
+
+    def write_csv(self, path):
+        """Write two CSVs derived from `path`: _occupancy and _movements."""
+        _write_rows_csv(
+            self.occupancy_rows(),
+            _suffixed_path(path, "occupancy"),
+            "ZoneAnalyzer (occupancy)",
+        )
+        _write_rows_csv(
+            self.movement_rows(),
+            _suffixed_path(path, "movements"),
+            "ZoneAnalyzer (movements)",
+        )
+
+    def plot(self, path, title="Intersection zones"):
+        """Write two PNGs derived from `path`: _occupancy and _movements."""
+        self._plot_occupancy(
+            _suffixed_path(path, "occupancy"), f"{title}: occupancy per arm"
+        )
+        self._plot_movements(
+            _suffixed_path(path, "movements"), f"{title}: turning movements"
+        )
+
+    def _plot_occupancy(self, path, title):
+        rows = self.occupancy_rows()
+        if not rows:
+            print(f"ZoneAnalyzer: no occupancy data; not plotting {path}.")
+            return
+
+        plt = _plt()
+        window_labels = _sorted_windows(rows)
+        zone_names = sorted({row["zone"] for row in rows})
+        x = list(range(len(window_labels)))
+
+        mean_by_zone = defaultdict(dict)
+        max_by_zone = defaultdict(dict)
+        for row in rows:
+            mean_by_zone[row["zone"]][row["window"]] = row[
+                "mean_vehicles_in_zone"
+            ]
+            max_by_zone[row["zone"]][row["window"]] = row[
+                "max_vehicles_in_zone"
+            ]
+
+        fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+        _grouped_bars(
+            ax_top,
+            x,
+            [
+                (
+                    zone_name,
+                    [
+                        mean_by_zone[zone_name].get(label, 0)
+                        for label in window_labels
+                    ],
+                )
+                for zone_name in zone_names
+            ],
+        )
+        ax_top.set_ylabel("Mean vehicles in zone")
+        ax_top.set_title(title)
+        ax_top.legend(loc="upper right", fontsize="small")
+
+        for zone_name in zone_names:
+            ax_bot.plot(
+                x,
+                [max_by_zone[zone_name].get(label, 0) for label in window_labels],
+                marker="o",
+                label=zone_name,
+            )
+        ax_bot.set_ylabel("Peak vehicles in zone")
+        ax_bot.set_xlabel("Time into video (mm:ss)")
+        ax_bot.set_xticks(x)
+        ax_bot.set_xticklabels(window_labels, rotation=45, ha="right")
+        ax_bot.legend(loc="upper right", fontsize="small")
+
+        fig.tight_layout()
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        print(f"ZoneAnalyzer: wrote occupancy plot to {path}")
+
+    def _plot_movements(self, path, title):
+        rows = self.movement_rows()
+        if not rows:
+            print(f"ZoneAnalyzer: no movements; not plotting {path}.")
+            return
+
+        plt = _plt()
+        window_labels = _sorted_windows(rows)
+        movements = sorted({row["movement"] for row in rows})
+        x = list(range(len(window_labels)))
+
+        count_by_movement = defaultdict(dict)
+        flow_by_movement = defaultdict(dict)
+        for row in rows:
+            count_by_movement[row["movement"]][row["window"]] = row[
+                "total_count"
+            ]
+            flow_by_movement[row["movement"]][row["window"]] = row[
+                "flow_rate_vph"
+            ]
+
+        fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+        _grouped_bars(
+            ax_top,
+            x,
+            [
+                (
+                    movement,
+                    [
+                        count_by_movement[movement].get(label, 0)
+                        for label in window_labels
+                    ],
+                )
+                for movement in movements
+            ],
+        )
+        ax_top.set_ylabel("Vehicles")
+        ax_top.set_title(title)
+        ax_top.legend(loc="upper right", fontsize="small")
+
+        for movement in movements:
+            ax_bot.plot(
+                x,
+                [
+                    flow_by_movement[movement].get(label, 0)
+                    for label in window_labels
+                ],
+                marker="o",
+                label=movement,
+            )
+        ax_bot.set_ylabel("Flow rate (veh/h)")
+        ax_bot.set_xlabel("Time into video (mm:ss)")
+        ax_bot.set_xticks(x)
+        ax_bot.set_xticklabels(window_labels, rotation=45, ha="right")
+        ax_bot.legend(loc="upper right", fontsize="small")
+
+        fig.tight_layout()
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        print(f"ZoneAnalyzer: wrote movements plot to {path}")
+
+
 def _new_density_window():
     return {
         "n_frames": 0,
@@ -475,6 +847,20 @@ def _new_density_window():
         "distinct_ids": set(),
         "distinct_class_counts": defaultdict(int),
     }
+
+
+def _new_zone_window():
+    return {
+        "total_sum": 0,
+        "total_max": 0,
+        "class_sum": defaultdict(int),
+    }
+
+
+def _suffixed_path(path, suffix):
+    """'report.csv' + 'occupancy' -> 'report_occupancy.csv'."""
+    stem, extension = os.path.splitext(path)
+    return f"{stem}_{suffix}{extension}"
 
 
 def _resolve_class_name(class_names, class_id):
@@ -547,6 +933,45 @@ def _segments_intersect(p1, p2, p3, p4):
     return ((d1 > 0 > d2) or (d1 < 0 < d2)) and (
         (d3 > 0 > d4) or (d3 < 0 < d4)
     )
+
+
+def _point_in_polygon(point, polygon):
+    """
+    True if `point` (x, y) lies inside `polygon` (a list of (x, y)
+    vertices), by ray casting: cast a ray from the point in the +x
+    direction and count how many polygon edges it crosses. An odd count
+    means inside. Correct for concave polygons as well as convex ones.
+
+    A point lying exactly on an edge is not guaranteed to resolve either
+    way, which is fine for vehicle centroids -- a boundary case settles
+    itself on the next frame, and the analyzer only reacts to a change
+    of zone, not to every frame's membership.
+
+    Hand-rolled rather than using cv2.pointPolygonTest so this module
+    stays stdlib-only (matplotlib is imported lazily in _plt()) and its
+    geometry stays unit-testable without OpenCV -- the same reason
+    _segments_intersect() above is hand-rolled.
+    """
+
+    x, y = point
+    inside = False
+    n = len(polygon)
+    j = n - 1
+
+    for i in range(n):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+
+        # Does edge j->i straddle the horizontal line through y? The
+        # strict inequality difference also guarantees yi != yj below.
+        if (yi > y) != (yj > y):
+            crossing_x = xj + (y - yj) * (xi - xj) / (yi - yj)
+            if crossing_x > x:
+                inside = not inside
+
+        j = i
+
+    return inside
 
 
 def _format_clock(seconds):
