@@ -6,11 +6,12 @@ from . import exceptions
 
 class SafetyManager:
 
-    def __init__(self, drone, telemetry: Telemetry):
-        """Receive the drone (for the read-only PX4 parameter audit) and
-        the telemetry manager."""
+    def __init__(self, drone, telemetry: Telemetry, camera=None):
+        """Receive the drone (for the read-only PX4 parameter audit), the
+        telemetry manager, and optionally the camera to preflight-check."""
         self.drone = drone
         self.telemetry = telemetry
+        self.camera = camera
         self.param_audit = PX4ParameterAudit(drone)
 
     async def check_battery(self) -> float:
@@ -59,6 +60,42 @@ class SafetyManager:
 
         print("Home position is OK")
 
+    async def check_camera(self):
+        """
+        Verify on the ground that the camera could actually record.
+
+        The whole point of this mission is to come back with a
+        recording, and a camera fault costs nothing to discover here but
+        costs an entire battery to discover at the observation waypoint.
+        Whether a failure blocks the flight is settings-controlled.
+
+        This governs the preflight only. Once airborne, a camera failure
+        never aborts the mission -- see MissionManager._fly_waypoint().
+        """
+
+        if self.camera is None:
+            print(
+                "Camera check skipped: no camera was given to SafetyManager."
+            )
+            return
+
+        try:
+            await self.camera.preflight_check()
+        except Exception as e:
+            if settings.REQUIRE_CAMERA_PREFLIGHT:
+                raise exceptions.CameraPreflightError(
+                    f"Camera preflight check failed: {e}"
+                ) from e
+
+            print(
+                f"WARNING: camera preflight check failed: {e}. "
+                "REQUIRE_CAMERA_PREFLIGHT is False, so the mission will fly "
+                "anyway and may return no recording."
+            )
+            return
+
+        print("Camera is OK")
+
     async def check_flight_mode(self):
         """Get and display the current flight mode."""
 
@@ -92,6 +129,8 @@ class SafetyManager:
             )
 
         await self.check_battery()
+
+        await self.check_camera()
 
         # Read-only; logs PX4's own failsafe/limit configuration and warns
         # (never fails) if an application limit is inconsistent with it.

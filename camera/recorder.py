@@ -34,6 +34,23 @@ class Recorder(ABC):
     def is_recording(self) -> bool:
         raise NotImplementedError
 
+    @abstractmethod
+    async def preflight_check(self):
+        """
+        Verify on the ground that this recorder could actually record.
+
+        Called from SafetyManager.preflight_check() before arming, so a
+        missing camera, an unwritable output directory, or a full disk
+        is discovered while still on the ground rather than on arrival
+        at the observation waypoint -- by which point the battery for
+        the transit has already been spent.
+
+        Raise on failure. Whether that failure blocks the mission is the
+        caller's decision (settings.REQUIRE_CAMERA_PREFLIGHT), not this
+        method's.
+        """
+        raise NotImplementedError
+
 
 class SimulationRecorder(Recorder):
     """
@@ -53,6 +70,16 @@ class SimulationRecorder(Recorder):
     @property
     def is_recording(self) -> bool:
         return self._recording
+
+    async def preflight_check(self):
+        # Nothing to verify: there is no camera and no output file. Says
+        # so out loud rather than passing silently, so a preflight log
+        # never reads as if a real camera had been checked.
+        print(
+            "SimulationRecorder: preflight check skipped (no camera, no "
+            "output file). Set CAMERA_BACKEND='picamera2' to check real "
+            "hardware."
+        )
 
     async def start_recording(self):
         if self._recording:

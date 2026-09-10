@@ -6,10 +6,11 @@ observation with a (currently simulated) camera, and offline-analyzes
 the recording with a trained YOLO model to produce a traffic-volume
 report.
 
-**Status: SITL/Gazebo only.** Final hardware (Raspberry Pi + Camera
-Module 3) is not available yet. Nothing here has been validated on real
-hardware — see [Safety status](#safety-status) before assuming any of
-this is flight-ready outside simulation.
+**Status: SITL/Gazebo only.** The Raspberry Pi + Camera Module 3 are now
+in hand, but no flight controller is wired to them and nothing has been
+flown. See [Raspberry Pi camera](#raspberry-pi-camera) for bring-up, and
+[Safety status](#safety-status) before assuming any of this is
+flight-ready outside simulation.
 
 ## Repository layout
 
@@ -34,8 +35,9 @@ mission/                 Mission planning and execution
   mission_manager.py            Executes a Mission: sequencing, monitor coordination, camera, RTL
 
 camera/                  Camera + offline vision analysis
-  recorder.py               Recorder interface + SimulationRecorder (current, no hardware)
-  pi_camera.py               Real Picamera2 implementation (hardware-gated, not yet tested)
+  recorder.py               Recorder interface + SimulationRecorder (default, no hardware)
+  pi_camera.py               Real Picamera2 implementation (hardware-gated, not yet flown)
+  camera_check.py             CLI: standalone Pi camera bring-up -- preflight, record, report
   factory.py                  Selects the recorder backend from config.settings.CAMERA_BACKEND
   detector.py / processor.py    YOLO detection+tracking / ROI lane counting (offline only)
   detections.py                 Shared helper: reads results.boxes OR results.obb (OBB models)
@@ -50,6 +52,7 @@ tests/
   sitl/                       Gazebo/SITL integration scenarios (needs a running PX4 SITL instance)
 
 docs/px4_parameter_checklist.md   Human-reviewed PX4 parameter checklist (pairs with px4_params.py)
+docs/raspberry_pi_setup.md         Pi + Camera Module 3 bring-up: install, verify, record
 ```
 
 ## Setup
@@ -75,10 +78,11 @@ required to fly a mission or run the flight-critical tests.
 pytest tests/unit -q
 ```
 
-100 tests covering flight/mission logic, the exception-dispatch policy,
-mission validation, config consistency, and the PX4 parameter audit —
+132 tests covering flight/mission logic, the exception-dispatch policy,
+mission validation, config consistency, the camera recorders (against a
+fake picamera2, so no hardware is needed), and the PX4 parameter audit —
 all against fakes, no MAVSDK connection required. This is the suite to
-run on every change.
+run on every change, on the development machine and on the Pi alike.
 
 ```bash
 pytest tests/vision -q
@@ -144,7 +148,16 @@ altitude-reference frame documented on every value. Notable ones:
   place, so an unset/misconfigured `MISSION_SITE` always falls back to
   something harmless instead of a stale real-world coordinate.
 - `CAMERA_BACKEND` — `"simulation"` (default, no hardware) or
-  `"picamera2"` (real Raspberry Pi Camera Module 3, once available).
+  `"picamera2"` (real Raspberry Pi Camera Module 3). Stays
+  `"simulation"` in version control because this repo is also checked
+  out on machines with no camera; see
+  [`docs/raspberry_pi_setup.md`](docs/raspberry_pi_setup.md).
+- `RECORDING_OUTPUT_DIR`, `CAMERA_RESOLUTION`, `CAMERA_FRAMERATE`,
+  `CAMERA_BITRATE` — capture settings for the real camera.
+- `REQUIRE_CAMERA_PREFLIGHT` — whether a failed **ground** camera check
+  blocks the mission (default `True`: aborting on the ground is free,
+  and a full observation flight that records nothing is a wasted
+  battery). Once airborne, a camera failure never aborts the mission.
 - `TAKEOFF_ALTITUDE_M`, `OBSERVATION_ALTITUDE_M`,
   `MIN_/MAX_FLIGHT_ALTITUDE_M`, `MAX_DISTANCE_FROM_HOME_M`,
   `MAX_HORIZONTAL_SPEED_M_S`, `MAX_ASCENT_/MAX_DESCENT_SPEED_M_S`,
@@ -156,6 +169,27 @@ correctly, altitude window sane). `flight/px4_params.py` separately
 warns at every preflight if an application limit is looser than the
 real PX4 airframe's own configured limit — read `docs/px4_parameter_checklist.md`
 before ever flying real hardware.
+
+## Raspberry Pi camera
+
+The Pi and Camera Module 3 have arrived; there is no flight controller
+wired to them yet. Full bring-up steps are in
+[`docs/raspberry_pi_setup.md`](docs/raspberry_pi_setup.md) — including
+the two things that most often break this setup: **picamera2 must come
+from `apt`, not `pip`**, and the venv must be created with
+**`--system-site-packages`** or it cannot see it.
+
+Once installed, the standalone bring-up check needs no PX4, no flight
+controller and no mission:
+
+```bash
+python -m camera.camera_check --seconds 10 --backend picamera2
+```
+
+It runs the recorder's preflight check (camera detected, output
+directory writable, room for a full recording), records, stops, and
+reports the resulting file and its sidecar metadata — driving the same
+code path `MissionManager` uses, so a pass means the recorder works.
 
 ## Offline traffic analysis
 
@@ -329,5 +363,14 @@ path via `--model`.
   load. Do not fly real hardware without working through
   `docs/px4_parameter_checklist.md` and a staged flight-test plan
   (bench → tethered hover → short low-altitude flight → full mission).
+- **A passing camera check is not flight readiness either.**
+  `camera/camera_check.py` proves the Pi can record. It says nothing
+  about the Pi↔PX4 link, which does not exist yet, and nothing about
+  sustained thermal behaviour unless you actually run it for a full
+  `VIDEO_DURATION` with the enclosure closed.
+- **`camera/pi_camera.py` has never been executed against real
+  hardware.** Its picamera2 calls are written from the documented
+  interface, not verified against the installed package. Verify them
+  before the first run — `docs/raspberry_pi_setup.md` step 5.
 - `flight/px4_params.py` reads PX4 parameters read-only, purely to log
   them and warn about inconsistencies — it never writes a PX4 parameter.

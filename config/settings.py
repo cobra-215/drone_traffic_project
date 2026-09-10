@@ -28,7 +28,13 @@
 # 14540.
 #
 # For a real vehicle, this value depends on the actual
-# telemetry/network configuration.
+# telemetry/network configuration. A Raspberry Pi wired to a flight
+# controller's TELEM port normally uses a serial address instead, e.g.
+#     PX4_CONNECTION_ADDRESS = "serial:///dev/serial0:921600"
+# UNVERIFIED: there is no flight controller to test that against yet, so
+# the SITL value below remains the default. Do not switch to serial
+# without confirming the device path and baud rate on the actual
+# hardware -- see docs/raspberry_pi_setup.md.
 PX4_CONNECTION_ADDRESS = "udpin://0.0.0.0:14540"
 
 # Maximum time allowed while establishing the connection.
@@ -204,6 +210,39 @@ VIDEO_DURATION = 15 * 60
 #     this reason.
 CAMERA_BACKEND = "simulation"
 
+# Where PiCamera2Recorder writes recordings. "~" is expanded at use, so
+# this works whatever the Pi's username is -- Raspberry Pi OS Bookworm
+# has no "pi" user unless one is explicitly created, which is why this
+# is not hardcoded to /home/pi.
+RECORDING_OUTPUT_DIR = "~/recordings"
+
+# Capture settings for the picamera2 backend. Ignored by the simulation
+# backend, which produces no video.
+#
+# UNVERIFIED against real hardware: whether the Pi can sustain this
+# resolution/framerate/bitrate without dropping frames or thermally
+# throttling is exactly the kind of thing SITL cannot tell you. Start
+# here, measure with camera/camera_check.py, and lower if needed.
+CAMERA_RESOLUTION = (1920, 1080)
+CAMERA_FRAMERATE = 30
+CAMERA_BITRATE = 10_000_000  # bits/s; ~75 MB per minute of recording
+
+# Whether a failed camera preflight check blocks the mission.
+#
+# True: the mission aborts ON THE GROUND if the camera is missing,
+#     undetected, or the recording directory is unwritable/full. Aborting
+#     on the ground is free, and the entire point of this mission is to
+#     come back with a recording -- flying a full observation profile
+#     that records nothing is a wasted battery, not a success.
+# False: the same failures are printed as a warning and the mission flies
+#     anyway.
+#
+# Note this governs only the PREFLIGHT check. Once airborne, a camera
+# failure never aborts the mission -- see MissionManager._fly_waypoint().
+# A camera problem degrades the data-collection outcome; it must never
+# degrade the flight.
+REQUIRE_CAMERA_PREFLIGHT = True
+
 
 # ============================================================
 # EMERGENCY RESPONSE
@@ -322,3 +361,31 @@ def validate_settings():
             f"CAMERA_BACKEND={CAMERA_BACKEND!r} is not a recognised "
             "backend (expected 'simulation' or 'picamera2')."
         )
+
+    if (
+        not isinstance(CAMERA_RESOLUTION, (tuple, list))
+        or len(CAMERA_RESOLUTION) != 2
+        or any(int(value) <= 0 for value in CAMERA_RESOLUTION)
+    ):
+        raise ValueError(
+            "CAMERA_RESOLUTION must be a (width, height) pair of positive "
+            f"integers, got {CAMERA_RESOLUTION!r}."
+        )
+
+    if CAMERA_FRAMERATE <= 0:
+        raise ValueError(
+            f"CAMERA_FRAMERATE must be positive, got {CAMERA_FRAMERATE}."
+        )
+
+    if CAMERA_BITRATE <= 0:
+        raise ValueError(
+            f"CAMERA_BITRATE must be positive, got {CAMERA_BITRATE}."
+        )
+
+    if VIDEO_DURATION <= 0:
+        raise ValueError(
+            f"VIDEO_DURATION must be positive, got {VIDEO_DURATION}."
+        )
+
+    if not RECORDING_OUTPUT_DIR:
+        raise ValueError("RECORDING_OUTPUT_DIR must not be empty.")

@@ -57,10 +57,10 @@ async def components():
 
     drone = Drone(takeoff_altitude=settings.TAKEOFF_ALTITUDE_M)
     telemetry = Telemetry(drone)
-    safety = SafetyManager(drone=drone, telemetry=telemetry)
+    camera = build_recorder()
+    safety = SafetyManager(drone=drone, telemetry=telemetry, camera=camera)
     monitor = FlightMonitor(telemetry=telemetry)
     emergency = Emergency(drone=drone, telemetry=telemetry)
-    camera = build_recorder()
 
     try:
         yield drone, telemetry, safety, monitor, emergency, camera

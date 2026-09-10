@@ -25,6 +25,11 @@ def restore_settings():
         "WAYPOINT_ALTITUDE_TOLERANCE_M",
         "MISSION_SITE",
         "CAMERA_BACKEND",
+        "CAMERA_RESOLUTION",
+        "CAMERA_FRAMERATE",
+        "CAMERA_BITRATE",
+        "RECORDING_OUTPUT_DIR",
+        "VIDEO_DURATION",
     ]
     original = {name: getattr(settings, name) for name in tracked}
     yield
@@ -81,6 +86,44 @@ def test_rejects_unknown_camera_backend(restore_settings):
 
 
 def test_default_camera_backend_is_simulation():
-    # The Raspberry Pi Camera Module 3 is not available yet; this must
-    # never default to "picamera2" in version control.
+    # This repository is checked out on machines with no camera (the
+    # development machine, CI), so the committed default must stay
+    # "simulation". Selecting "picamera2" is a deliberate, Pi-local
+    # change -- see docs/raspberry_pi_setup.md.
     assert settings.CAMERA_BACKEND == "simulation"
+
+
+def test_rejects_bad_camera_resolution(restore_settings):
+    for bad in ((0, 1080), (1920,), (1920, 0), 1920, None):
+        settings.CAMERA_RESOLUTION = bad
+        with pytest.raises(ValueError):
+            settings.validate_settings()
+
+
+def test_accepts_camera_resolution_as_a_list(restore_settings):
+    settings.CAMERA_RESOLUTION = [1280, 720]
+    settings.validate_settings()
+
+
+def test_rejects_non_positive_framerate(restore_settings):
+    settings.CAMERA_FRAMERATE = 0
+    with pytest.raises(ValueError):
+        settings.validate_settings()
+
+
+def test_rejects_non_positive_bitrate(restore_settings):
+    settings.CAMERA_BITRATE = -1
+    with pytest.raises(ValueError):
+        settings.validate_settings()
+
+
+def test_rejects_non_positive_video_duration(restore_settings):
+    settings.VIDEO_DURATION = 0
+    with pytest.raises(ValueError):
+        settings.validate_settings()
+
+
+def test_rejects_empty_recording_output_dir(restore_settings):
+    settings.RECORDING_OUTPUT_DIR = ""
+    with pytest.raises(ValueError):
+        settings.validate_settings()

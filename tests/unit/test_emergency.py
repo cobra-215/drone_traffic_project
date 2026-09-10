@@ -49,6 +49,9 @@ NO_COMMAND_EXCEPTIONS = [
     ex.ArmingError("x"),
     ex.GPSNotReadyError("x"),
     ex.HomePositionNotReadyError("x"),
+    # A camera preflight failure happens before arming, with the vehicle
+    # on the ground -- commanding RTL in response would be meaningless.
+    ex.CameraPreflightError("x"),
 ]
 
 

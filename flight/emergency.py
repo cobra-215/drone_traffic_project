@@ -16,6 +16,7 @@ NO_FLIGHT_COMMAND_EXCEPTIONS = (
     exceptions.ArmingError,
     exceptions.GPSNotReadyError,
     exceptions.HomePositionNotReadyError,
+    exceptions.CameraPreflightError,
 )
 
 

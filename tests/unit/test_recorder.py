@@ -1,6 +1,15 @@
 from camera.recorder import SimulationRecorder
 
 
+async def test_preflight_check_is_a_noop_that_says_so(capsys):
+    # It must not pass silently: a preflight log that reads as if a real
+    # camera had been checked would be actively misleading.
+    recorder = SimulationRecorder()
+    await recorder.preflight_check()
+    assert "SimulationRecorder" in capsys.readouterr().out
+    assert recorder.is_recording is False
+
+
 async def test_starts_not_recording():
     recorder = SimulationRecorder()
     assert recorder.is_recording is False

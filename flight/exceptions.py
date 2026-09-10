@@ -98,6 +98,23 @@ class MissionAbortError(DroneError):
     pass
 
 
+class CameraPreflightError(DroneError):
+    """
+    When the camera cannot be verified on the ground before flight.
+
+    Only ever raised from SafetyManager.check_camera(), before arming,
+    and only when settings.REQUIRE_CAMERA_PREFLIGHT is True. Emergency
+    treats it as a no-flight-command case (see
+    NO_FLIGHT_COMMAND_EXCEPTIONS): the vehicle is still disarmed on the
+    ground, so commanding RTL in response would be meaningless.
+
+    Deliberately has no in-flight counterpart -- once airborne, a camera
+    failure degrades the mission's data-collection outcome and must
+    never abort the flight (see MissionManager._fly_waypoint()).
+    """
+    pass
+
+
 class EmergencyCommandError(DroneError):
     """
     When an emergency-response flight command (RTL / land / hold) itself

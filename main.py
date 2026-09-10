@@ -48,9 +48,15 @@ async def main():
 
     telemetry = Telemetry(drone)
 
+    # Built before SafetyManager so preflight can verify the camera on
+    # the ground, rather than discovering a fault on arrival at the
+    # observation waypoint with the transit battery already spent.
+    camera = build_recorder()
+
     safety = SafetyManager(
         drone=drone,
         telemetry=telemetry,
+        camera=camera,
     )
 
     monitor = FlightMonitor(
@@ -62,7 +68,6 @@ async def main():
         telemetry=telemetry,
     )
 
-    camera = build_recorder()
     mission = build_mission()
 
     mission_manager = MissionManager(
